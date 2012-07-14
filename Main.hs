@@ -4,11 +4,12 @@ module Main where
 import Prelude hiding (Either(..))
 import System.Console.ANSI
 import System.IO
+import System.Exit (exitSuccess)
 
 import Reactive.Banana
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Control.Monad (when,forM)
+import Control.Monad (when,forM,forever)
 import Data.Maybe (fromJust)
 import Data.Monoid
 
@@ -32,11 +33,7 @@ type KeyMap = Map Char Input
 type EventMap = Map Input (EventSource ())
 
 main = do
-    hSetEcho stdin False
-    hSetBuffering stdin  NoBuffering
-    hSetBuffering stdout NoBuffering
-    hideCursor
-    setTitle "Cabbages and Kings"
+    initScreen
     let keymap = keyMap
     eventmap <- registerEvents
 
@@ -46,6 +43,7 @@ main = do
         eleft  <- fromEM Left eventmap
         eright <- fromEM Right eventmap
         erd    <- fromEM Redraw eventmap
+        eexit    <- fromEM Exit eventmap
 
         let emup    = (|+| ( 0,-1)) <$ eup
             emdown  = (|+| ( 0, 1)) <$ edown
@@ -56,21 +54,20 @@ main = do
             epos    = accumE (0,0) emove
 
         reactimate $ drawHero <$> epos
+        reactimate $ handleExit <$ eexit
     
     actuate network
 
     fire Redraw eventmap
-    let loop = do
+    forever $ do
             char <- getChar
             case char of
                 'k' -> fire Up eventmap
                 'j' -> fire Down  eventmap
                 'h' -> fire Left  eventmap
                 'l' -> fire Right  eventmap
+                'q' -> fire Exit  eventmap
                 _   -> return ()
-            when (char /= 'q') loop
-    loop
-    handleExit
 
 keyMap :: KeyMap
 keyMap =
@@ -89,12 +86,40 @@ registerEvents = do
             return (i,x)
         return . Map.fromList $ l
 
+{- Hypothetical functions 
+newEvent i = do
+        m <- ask
+        return $ fromEM i m
+
+newEvent i = do
+        (e,a) <- newAddHandler
+        tell (i,a)
+        return $ fromAddHandler e
+
+fire i = do
+        m <- ask
+        fire i m
+-}
+{-
+network = do
+        ekeypress <- getEvent KeyPress
+        let einput = flip fmap $ ekeypress $ \x -> keylookup x
+            eup = filterE (== Up) einput
+-}
+
 
 fromEM :: Input -> EventMap -> NetworkDescription t (Event t ())
 fromEM e evmap = fromAddHandler . fst . fromJust $ Map.lookup e evmap
 
 fire :: Input -> EventMap -> IO ()
 fire e evmap = (snd $ fromJust $ Map.lookup e evmap) $ ()
+
+initScreen = do
+    hSetEcho stdin False
+    hSetBuffering stdin  NoBuffering
+    hSetBuffering stdout NoBuffering
+    hideCursor
+    setTitle "Cabbages and Kings"
 
 drawHero (heroX, heroY) = do
   clearScreen
@@ -113,4 +138,5 @@ handleExit = do
   setSGR [ SetConsoleIntensity NormalIntensity
          , SetColor Foreground Dull White ]
   putStrLn "Thank you for playing!"
+  exitSuccess
 
