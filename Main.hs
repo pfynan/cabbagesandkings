@@ -1,4 +1,5 @@
 --file: Main.hs
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
 import Prelude hiding (Either(..))
@@ -10,8 +11,10 @@ import Reactive.Banana
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Control.Monad (when,forM,forever)
+import Control.Monad.Reader
 import Data.Maybe (fromJust)
 import Data.Monoid
+
 
 type Coord = (Int, Int)
 
@@ -30,44 +33,18 @@ data Input = Up
 
 type EventSource a = (AddHandler a, a -> IO ())
 type KeyMap = Map Char Input
-type EventMap = Map Input (EventSource ())
 
 main = do
     initScreen
-    let keymap = keyMap
-    eventmap <- registerEvents
 
-    network <- compile $ do
-        eup    <- fromEM Up eventmap
-        edown  <- fromEM Down eventmap
-        eleft  <- fromEM Left eventmap
-        eright <- fromEM Right eventmap
-        erd    <- fromEM Redraw eventmap
-        eexit    <- fromEM Exit eventmap
+    keypress <- newAddHandler
+    compile (network keypress) >>= actuate
 
-        let emup    = (|+| ( 0,-1)) <$ eup
-            emdown  = (|+| ( 0, 1)) <$ edown
-            emleft  = (|+| (-1, 0)) <$ eleft
-            emright = (|+| ( 1, 0)) <$ eright
-            emrd    = id <$ erd
-            emove   = emup `union` emdown `union` emleft `union` emright `union` emrd
-            epos    = accumE (0,0) emove
+    let kp = snd keypress
 
-        reactimate $ drawHero <$> epos
-        reactimate $ handleExit <$ eexit
-    
-    actuate network
+    kp 'r'
 
-    fire Redraw eventmap
-    forever $ do
-            char <- getChar
-            case char of
-                'k' -> fire Up eventmap
-                'j' -> fire Down  eventmap
-                'h' -> fire Left  eventmap
-                'l' -> fire Right  eventmap
-                'q' -> fire Exit  eventmap
-                _   -> return ()
+    forever $ getChar >>= kp
 
 keyMap :: KeyMap
 keyMap =
@@ -75,44 +52,51 @@ keyMap =
         <>  bindKey 'j' Down
         <>  bindKey 'h' Left
         <>  bindKey 'l' Right
+        <>  bindKey 'r' Redraw
+        <>  bindKey 'q' Exit
 
 bindKey :: Char -> Input -> KeyMap
 bindKey = Map.singleton
 
-registerEvents :: IO EventMap
-registerEvents = do
-        l <- forM [minBound..maxBound] $ \i -> do
-            x <- newAddHandler
-            return (i,x)
-        return . Map.fromList $ l
-
-{- Hypothetical functions 
-newEvent i = do
-        m <- ask
-        return $ fromEM i m
-
-newEvent i = do
-        (e,a) <- newAddHandler
-        tell (i,a)
-        return $ fromAddHandler e
-
-fire i = do
-        m <- ask
-        fire i m
--}
-{-
-network = do
-        ekeypress <- getEvent KeyPress
-        let einput = flip fmap $ ekeypress $ \x -> keylookup x
-            eup = filterE (== Up) einput
--}
+registerKeyPress :: forall t. ReaderT (EventSource Char)
+                                (NetworkDescription t) 
+                                (Event t Char)
+registerKeyPress = do
+        x <- ask
+        lift . fromAddHandler . fst $ x
 
 
-fromEM :: Input -> EventMap -> NetworkDescription t (Event t ())
-fromEM e evmap = fromAddHandler . fst . fromJust $ Map.lookup e evmap
+network :: forall t. (EventSource Char) -> NetworkDescription t ()
+network = runReaderT $ do
+    keypress <- registerKeyPress
 
-fire :: Input -> EventMap -> IO ()
-fire e evmap = (snd $ fromJust $ Map.lookup e evmap) $ ()
+    let matchE t = filterE (== t)
+        dup f a = (f a,f a)
+
+    let input  = filterJust $ (\x -> Map.lookup x keyMap) <$> keypress
+        up     = matchE Up     input
+        down   = matchE Down   input
+        left   = matchE Left   input
+        right  = matchE Right  input
+        redraw = matchE Redraw input
+        exit   = matchE Exit   input
+
+    let emup             = (|+| ( 0,-1)) <$ up
+        emdown           = (|+| ( 0, 1)) <$ down
+        emleft           = (|+| (-1, 0)) <$ left
+        emright          = (|+| ( 1, 0)) <$ right
+        emrd             = id            <$ redraw
+        emove            = emup 
+                   `union` emdown
+                   `union` emleft 
+                   `union` emright
+                   `union` emrd
+        emovechecked     = filterApply ((\pos move -> isOnscreen (move $ pos)) <$> bpos) emove
+        (epos,bpos)      = mapAccum (0,0) $ dup <$> emovechecked
+        isOnscreen (x,y) = x >= 0 && y >= 0 && x <= 79 && y <= 24
+        
+    lift . reactimate $ drawHero <$> epos
+    lift . reactimate $ handleExit <$ exit
 
 initScreen = do
     hSetEcho stdin False
