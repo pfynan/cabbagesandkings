@@ -1,126 +1,172 @@
 --file: Main.hs
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ScopedTypeVariables, TemplateHaskell, TypeOperators #-}
 module Main where
 
-import Prelude hiding (Either(..))
-import System.Console.ANSI
-import System.IO
+import Prelude hiding (id,(.))
 import System.Exit (exitSuccess)
 
 import Reactive.Banana
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Control.Monad (when,forM,forever)
-import Control.Monad.Reader
-import Data.Maybe (fromJust)
+import Control.Category
 import Data.Monoid
+import Data.Label
+import Data.Array
+import UI.HSCurses.Curses
+import Control.Monad(forever)
+import Control.Exception(bracket_)
+import Control.Monad(forM_)
 
-
-type Coord = (Int, Int)
-
--- operator to add 2 coordinates together
-(|+|) :: Coord -> Coord -> Coord
-(|+|) (x1, y1) (x2, y2) = (x1 + x2, y1 + y2)
-
-
-data Input = Up
-           | Down
-           | Left
-           | Right
-           | Exit
-           | Redraw
-           deriving (Eq,Enum,Bounded,Ord)
+import World
 
 type EventSource a = (AddHandler a, a -> IO ())
+
+
+data Input = MoveUp
+           | MoveDown
+           | MoveLeft
+           | MoveRight
+           | Exit
+           | Redraw
+           deriving (Eq,Ord)
+
 type KeyMap = Map Char Input
 
-main = do
-    initScreen
+main ::  IO c
+main = bracket_ initCurses (endWin >> putStrLn "Be seeing you...")  $ do
+    
+    echo False
 
-    keypress <- newAddHandler
-    compile (network keypress) >>= actuate
+    eventsource <- newAddHandler
+    compile (network eventsource) >>= actuate
 
-    let kp = snd keypress
 
-    kp 'r'
+    let kp (KeyChar k) = snd eventsource k
+        kp _ = return ()
 
-    forever $ getChar >>= kp
+    snd eventsource  'r' 
+
+    forever $ getCh >>= kp
 
 keyMap :: KeyMap
-keyMap =
-           bindKey 'k' Up
-        <>  bindKey 'j' Down
-        <>  bindKey 'h' Left
-        <>  bindKey 'l' Right
-        <>  bindKey 'r' Redraw
-        <>  bindKey 'q' Exit
+keyMap = 'k' ~> MoveUp
+       <> 'j' ~> MoveDown
+       <> 'h' ~> MoveLeft
+       <> 'l' ~> MoveRight
+       <> 'r' ~> Redraw
+       <> 'q' ~> Exit
 
-bindKey :: Char -> Input -> KeyMap
-bindKey = Map.singleton
+(~>) :: a -> b -> Map a b
+(~>) = Map.singleton
 
-registerKeyPress :: forall t. ReaderT (EventSource Char)
-                                (NetworkDescription t) 
-                                (Event t Char)
-registerKeyPress = do
-        x <- ask
-        lift . fromAddHandler . fst $ x
+registerKeyPress :: (AddHandler a, b)-> NetworkDescription t (Reactive.Banana.Event t a)
+registerKeyPress es = fromAddHandler . fst $ es
 
+matchE t = filterE (== t)
 
-network :: forall t. (EventSource Char) -> NetworkDescription t ()
-network = runReaderT $ do
-    keypress <- registerKeyPress
+network :: forall t. EventSource Char -> NetworkDescription t ()
+network ev = do
+    keypress <- registerKeyPress ev
 
-    let matchE t = filterE (== t)
-        dup f a = (f a,f a)
+    let applyE e b = (\bv ef -> ef bv) <$> b <@> e
 
-    let input  = filterJust $ (\x -> Map.lookup x keyMap) <$> keypress
-        up     = matchE Up     input
-        down   = matchE Down   input
-        left   = matchE Left   input
-        right  = matchE Right  input
-        redraw = matchE Redraw input
+    let input  = filterJust $ (`Map.lookup` keyMap) <$> keypress
         exit   = matchE Exit   input
+        emove  = eMove input
 
-    let emup             = (|+| ( 0,-1)) <$ up
-        emdown           = (|+| ( 0, 1)) <$ down
-        emleft           = (|+| (-1, 0)) <$ left
-        emright          = (|+| ( 1, 0)) <$ right
-        emrd             = id            <$ redraw
-        emove            = emup 
-                   `union` emdown
-                   `union` emleft 
-                   `union` emright
-                   `union` emrd
-        emovechecked     = filterApply ((\pos move -> isOnscreen (move $ pos)) <$> bpos) emove
-        (epos,bpos)      = mapAccum (0,0) $ dup <$> emovechecked
-        isOnscreen (x,y) = x >= 0 && y >= 0 && x <= 79 && y <= 24
+    let 
+        collides lvl mons p = ((`notElem` [Empty,Tree]) . fixedAtPos lvl) p
+                                 && Nothing == moveableAtPos mons p
         
-    lift . reactimate $ drawHero <$> epos
-    lift . reactimate $ handleExit <$ exit
 
-initScreen = do
-    hSetEcho stdin False
-    hSetBuffering stdin  NoBuffering
-    hSetBuffering stdout NoBuffering
-    hideCursor
-    setTitle "Cabbages and Kings"
+        enewpos = emove `applyE` bpos
+        enewposchecked = filterApply (collides <$> blevel <*> bmonsters) enewpos
 
-drawHero (heroX, heroY) = do
-  clearScreen
-  setCursorPosition heroY heroX
-  setSGR [ SetConsoleIntensity BoldIntensity
-         , SetColor Foreground Vivid Blue ]
-  putStr "@"
+        ecollidefix =  fixedAtPos initlevel <$> enewpos
+
+        ehitmonst :: Event t Moveable
+        ehitmonst = filterJust $ moveableAtPos <$> bmonsters <@> enewpos
+
+        etreed = matchE Tree ecollidefix
+
+        edmgmonst = modify (health . monster) (subtract 1) <$> ehitmonst
+
+        eumonst = updatemonster <$> edmgmonst
+
+        updatemonster m = Map.insert (get position m) m
+
+        ekillmonst = filterE (\m -> 0 >= get (health . monster) m) edmgmonst
+
+        edmonst = (\(Moveable a _) -> Map.delete a) <$> ekillmonst
+
+
+        bpos      = stepper inithero enewposchecked -- accumB inithero emovechecked
+        emsg = unions ["You eat a banana" <$ etreed
+                      ,(\m -> "You hit the stray dog" 
+                           ++ (show . get (health . monster) $ m)) <$> edmgmonst
+                      ,"You kill the stray dog" <$ ekillmonst
+                      ]
+        bmsg = stepper [""] ((:[]) <$> emsg)
+        bmonsters = accumB initmonsters (eumonst `union` edmonst)
+        blevel = stepper initlevel never
+
+        bscreen =  World <$> bpos <*> bmonsters <*> blevel <*> bmsg
+    
+
+    edraw <- changes bscreen
+
+    reactimate $ draw <$>  edraw
+    reactimate $ handleExit <$ exit
+
+eMove input = emove
+        where up      = matchE MoveUp     input
+              down    = matchE MoveDown   input
+              left    = matchE MoveLeft   input
+              right   = matchE MoveRight  input
+              redraw  = matchE Redraw input
+              emup    = (|+| ( 0,-1)) <$ up
+              emdown  = (|+| ( 0, 1)) <$ down
+              emleft  = (|+| (-1, 0)) <$ left
+              emright = (|+| ( 1, 0)) <$ right
+              emrd    = id            <$ redraw
+              emove   = emup
+                `union` emdown
+                `union` emleft 
+                `union` emright
+                `union` emrd
+
+-- dot = ((.).(.))
+
+isInBounds (x,y) ((x0,y0),(x1,y1)) = x >= x0 && y >= y0 && x <= x1 && y <= y1
+
+fixedAtPos lvl pos
+        | isInBounds pos $ bounds $ lvl = lvl ! pos
+        | otherwise = Empty
+
+moveableAtPos monsts pos = Map.lookup pos monsts 
+
+
+renderObj Wall  = '#'
+renderObj Floor = '.'
+renderObj Tree  = '+'
+
+renderMonster (Moveable _ (StrayDog _)) = 'd'
+
+draw w = draw' >> refresh
+        where renderedlevel = renderObj <$> get level w
+              updates = [(get hero w,'@')]
+                      <> Map.toList (renderMonster <$> (get monsters w))
+              flatlevel = renderedlevel // updates
+              draw' = do 
+                forM_ [(y,x) | y <- [0..24], x <- [0..79]] $
+                            \(y,x) -> mvAddCh y x $ toCh (flatlevel ! (x,y))
+                mvWAddStr stdScr 25 0 $ head $ get messages w
+              toCh = fromIntegral . fromEnum
+
 
 
 -- when the user wants to exit we give them a thank you
 -- message and then reshow the cursor
-handleExit = do
-  clearScreen
-  setCursorPosition 0 0
-  showCursor
-  setSGR [ SetConsoleIntensity NormalIntensity
-         , SetColor Foreground Dull White ]
-  putStrLn "Thank you for playing!"
-  exitSuccess
+handleExit ::  IO a
+handleExit = exitSuccess
 
