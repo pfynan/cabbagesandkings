@@ -15,9 +15,10 @@ import Data.Array
 import UI.HSCurses.Curses
 import Control.Monad(forever)
 import Control.Exception(bracket_)
-import Control.Monad(forM_)
 
 import World
+import Draw
+import Data.List(delete)
 
 type EventSource a = (AddHandler a, a -> IO ())
 
@@ -44,7 +45,7 @@ main = bracket_ initCurses (endWin >> putStrLn "Be seeing you...")  $ do
     let kp (KeyChar k) = snd eventsource k
         kp _ = return ()
 
-    snd eventsource  'r' 
+    kp (KeyChar 'r')
 
     forever $ getCh >>= kp
 
@@ -62,60 +63,93 @@ keyMap = 'k' ~> MoveUp
 registerKeyPress :: (AddHandler a, b)-> NetworkDescription t (Reactive.Banana.Event t a)
 registerKeyPress es = fromAddHandler . fst $ es
 
+matchE :: Eq a => forall t. a -> Event t a -> Event t a
 matchE t = filterE (== t)
+
+applyE ::  Apply f g => g (a -> b) -> f a -> g b
+applyE e b = (\bv ef -> ef bv) <$> b <@> e
 
 network :: forall t. EventSource Char -> NetworkDescription t ()
 network ev = do
     keypress <- registerKeyPress ev
 
-    let applyE e b = (\bv ef -> ef bv) <$> b <@> e
 
     let input  = filterJust $ (`Map.lookup` keyMap) <$> keypress
         exit   = matchE Exit   input
-        emove  = eMove input
+        redraw = matchE Redraw input
+        emove  = eMove input -- Action
 
-    let 
-        collides lvl mons p = ((`notElem` [Empty,Tree]) . fixedAtPos lvl) p
-                                 && Nothing == moveableAtPos mons p
+    let -- Movin'
+        enextpos = emove `applyE` bpos
         
+        -- Reaction
+        enewpos = enohitmonst
 
-        enewpos = emove `applyE` bpos
-        enewposchecked = filterApply (collides <$> blevel <*> bmonsters) enewpos
+        -- Collision with tiles
+        -- Action
+        ecollidefix = splitfixed <$> enextpos
 
-        ecollidefix =  fixedAtPos initlevel <$> enewpos
+        splitfixed p = let t = fixedAtPos initlevel p in case t of
+                            Floor -> Left p
+                            _     -> Right t
 
-        ehitmonst :: Event t Moveable
-        ehitmonst = filterJust $ moveableAtPos <$> bmonsters <@> enewpos
+        (enohitfixed,ehitfixed) = split ecollidefix
 
-        etreed = matchE Tree ecollidefix
+        
+        --Reaction
+        etreed = matchE Tree ehitfixed
+        
+        -- Collision with monsters
+        -- Action
+        ecollidemonst = splitmonst <$> bmonsters <@> enohitfixed
 
+        splitmonst ms p = case moveableAtPos ms p of
+                              m:_ -> Right m
+                              []  -> Left p
+
+        (enohitmonst,ehitmonst) = split ecollidemonst
+
+        -- Reaction
         edmgmonst = modify (health . monster) (subtract 1) <$> ehitmonst
 
         eumonst = updatemonster <$> edmgmonst
 
-        updatemonster m = Map.insert (get position m) m
+        updatemonster m = Map.insert (get key m) m 
 
         ekillmonst = filterE (\m -> 0 >= get (health . monster) m) edmgmonst
 
-        edmonst = (\(Moveable a _) -> Map.delete a) <$> ekillmonst
+        edmonst = (\m -> Map.delete (get key m)) <$> ekillmonst
+        
+        -- Move monsters
+        -- Action
+        eturn = unions [ () <$ ehitmonst, () <$ enewpos]
 
+        -- Reaction
+        emovems = fmap movem <$ eturn
 
-        bpos      = stepper inithero enewposchecked -- accumB inithero emovechecked
+        movem m = m'
+            where m' = modify position (|+| (1,0)) m
+        
+        -- State or outputs
+        bpos :: Behavior t Coord
+        bpos = stepper inithero enewpos -- accumB inithero emovechecked
         emsg = unions ["You eat a banana" <$ etreed
-                      ,(\m -> "You hit the stray dog" 
+                      ,(\m -> "You hit the stray dog " 
                            ++ (show . get (health . monster) $ m)) <$> edmgmonst
                       ,"You kill the stray dog" <$ ekillmonst
                       ]
         bmsg = stepper [""] ((:[]) <$> emsg)
-        bmonsters = accumB initmonsters (eumonst `union` edmonst)
+        bmonsters = accumB initmonsters (eumonst `union` edmonst `union` emovems)
         blevel = stepper initlevel never
 
         bscreen =  World <$> bpos <*> bmonsters <*> blevel <*> bmsg
+        
+        eredraw = bscreen <@ redraw
     
 
     edraw <- changes bscreen
 
-    reactimate $ draw <$>  edraw
+    reactimate $ draw <$>  edraw `union` eredraw
     reactimate $ handleExit <$ exit
 
 eMove input = emove
@@ -123,19 +157,19 @@ eMove input = emove
               down    = matchE MoveDown   input
               left    = matchE MoveLeft   input
               right   = matchE MoveRight  input
-              redraw  = matchE Redraw input
+              --redraw  = matchE Redraw input
               emup    = (|+| ( 0,-1)) <$ up
               emdown  = (|+| ( 0, 1)) <$ down
               emleft  = (|+| (-1, 0)) <$ left
               emright = (|+| ( 1, 0)) <$ right
-              emrd    = id            <$ redraw
+              --emrd    = id            <$ redraw
               emove   = emup
                 `union` emdown
                 `union` emleft 
                 `union` emright
-                `union` emrd
+              --  `union` emrd
 
--- dot = ((.).(.))
+        
 
 isInBounds (x,y) ((x0,y0),(x1,y1)) = x >= x0 && y >= y0 && x <= x1 && y <= y1
 
@@ -143,25 +177,7 @@ fixedAtPos lvl pos
         | isInBounds pos $ bounds $ lvl = lvl ! pos
         | otherwise = Empty
 
-moveableAtPos monsts pos = Map.lookup pos monsts 
-
-
-renderObj Wall  = '#'
-renderObj Floor = '.'
-renderObj Tree  = '+'
-
-renderMonster (Moveable _ (StrayDog _)) = 'd'
-
-draw w = draw' >> refresh
-        where renderedlevel = renderObj <$> get level w
-              updates = [(get hero w,'@')]
-                      <> Map.toList (renderMonster <$> (get monsters w))
-              flatlevel = renderedlevel // updates
-              draw' = do 
-                forM_ [(y,x) | y <- [0..24], x <- [0..79]] $
-                            \(y,x) -> mvAddCh y x $ toCh (flatlevel ! (x,y))
-                mvWAddStr stdScr 25 0 $ head $ get messages w
-              toCh = fromIntegral . fromEnum
+moveableAtPos ms pos = Map.foldl' (\xs y -> if (get position y == pos) then y:xs else xs) [] ms 
 
 
 
