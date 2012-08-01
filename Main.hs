@@ -49,6 +49,7 @@ main = do
     keypress <- newAddHandler
     compile (network keypress) >>= actuate
 
+    -- Refresh the screen so it draws the first time
     fire keypress 'r'
 
     forever $ getChar >>= fire keypress
@@ -83,12 +84,10 @@ network kp = do
         emdown           = (|+| ( 0, 1)) <$ down
         emleft           = (|+| (-1, 0)) <$ left
         emright          = (|+| ( 1, 0)) <$ right
-        emrd             = id            <$ redraw
         emove            = emup 
                    `union` emdown
                    `union` emleft 
                    `union` emright
-                   `union` emrd
 
         -- Perform that action
         enewpos  = emove `applyE` bpos
@@ -98,8 +97,11 @@ network kp = do
 
         -- and keep track of the current position
         bpos     = stepper (0,0) enextpos
+
+        -- To redraw screen, just draw the behavior
+        eredraw  = bpos <@ redraw
         
-    reactimate $ drawHero <$> enextpos
+    reactimate $ drawHero <$> enextpos `union` eredraw
     reactimate $ handleExit <$ exit
 
 keyMap :: Char -> Maybe Input
