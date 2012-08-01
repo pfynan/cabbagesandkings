@@ -8,13 +8,12 @@ import System.IO
 import System.Exit (exitSuccess)
 
 import Reactive.Banana
-import Data.Map (Map)
-import qualified Data.Map as Map
-import Control.Monad (when,forM,forever)
-import Control.Monad.Reader
+import Control.Monad (forever)
 import Data.Maybe (fromJust)
-import Data.Monoid
 
+-----------------------
+-- Types
+-----------------------
 
 type Coord = (Int, Int)
 
@@ -23,16 +22,26 @@ type Coord = (Int, Int)
 (|+|) (x1, y1) (x2, y2) = (x1 + x2, y1 + y2)
 
 
+-- Input represents all the valid inputs 
 data Input = Up
            | Down
            | Left
            | Right
            | Exit
            | Redraw
-           deriving (Eq,Enum,Bounded,Ord)
+           deriving Eq
 
+-- EventSource is the connection between the network and the IO layer
+-- Cribbed shamelessly from:
+--      https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/examples/SlotMachine.hs
 type EventSource a = (AddHandler a, a -> IO ())
-type KeyMap = Map Char Input
+
+-- Again, cribbed from example
+fire :: EventSource a -> a -> IO ()
+fire = snd
+
+registerEvent :: EventSource a -> NetworkDescription t (Event t a)
+registerEvent = fromAddHandler . fst
 
 main = do
     initScreen
@@ -40,40 +49,28 @@ main = do
     keypress <- newAddHandler
     compile (network keypress) >>= actuate
 
-    let kp = snd keypress
+    fire keypress 'r'
 
-    kp 'r'
+    forever $ getChar >>= fire keypress
 
-    forever $ getChar >>= kp
+-- Some combinators to help make event network cleaner
 
-keyMap :: KeyMap
-keyMap =
-           bindKey 'k' Up
-        <>  bindKey 'j' Down
-        <>  bindKey 'h' Left
-        <>  bindKey 'l' Right
-        <>  bindKey 'r' Redraw
-        <>  bindKey 'q' Exit
+-- matchE only passes events that match parameter
+matchE ::  Eq a => a -> Event t a -> Event t a
+matchE t = filterE (== t)
 
-bindKey :: Char -> Input -> KeyMap
-bindKey = Map.singleton
+-- applyE applies a function in an event to a behavior
+applyE :: Event t (a -> b) -> Behavior t a -> Event t b
+applyE e b = (\b' e' -> e' b') <$> b <@> e
 
-registerKeyPress :: forall t. ReaderT (EventSource Char)
-                                (NetworkDescription t) 
-                                (Event t Char)
-registerKeyPress = do
-        x <- ask
-        lift . fromAddHandler . fst $ x
+network :: forall t. EventSource Char -> NetworkDescription t ()
+network kp = do
+    keypress <- registerEvent kp
 
+    let -- Convert key to valid input
+        input  = filterJust $ keyMap <$> keypress
 
-network :: forall t. (EventSource Char) -> NetworkDescription t ()
-network = runReaderT $ do
-    keypress <- registerKeyPress
-
-    let matchE t = filterE (== t)
-        dup f a = (f a,f a)
-
-    let input  = filterJust $ (\x -> Map.lookup x keyMap) <$> keypress
+        -- Separate out each input into its own event
         up     = matchE Up     input
         down   = matchE Down   input
         left   = matchE Left   input
@@ -81,7 +78,8 @@ network = runReaderT $ do
         redraw = matchE Redraw input
         exit   = matchE Exit   input
 
-    let emup             = (|+| ( 0,-1)) <$ up
+    let -- Replace input with function that performs action 
+        emup             = (|+| ( 0,-1)) <$ up
         emdown           = (|+| ( 0, 1)) <$ down
         emleft           = (|+| (-1, 0)) <$ left
         emright          = (|+| ( 1, 0)) <$ right
@@ -91,13 +89,29 @@ network = runReaderT $ do
                    `union` emleft 
                    `union` emright
                    `union` emrd
-        emovechecked     = filterApply ((\pos move -> isOnscreen (move $ pos)) <$> bpos) emove
-        (epos,bpos)      = mapAccum (0,0) $ dup <$> emovechecked
-        isOnscreen (x,y) = x >= 0 && y >= 0 && x <= 79 && y <= 24
-        
-    lift . reactimate $ drawHero <$> epos
-    lift . reactimate $ handleExit <$ exit
 
+        -- React by performing action
+        enewpos  = emove `applyE` bpos
+
+        -- ...but only if the result is on the screen
+        enextpos = filterE isOnscreen enewpos
+
+        -- and keep track of the current position
+        bpos     = stepper (0,0) enextpos
+        
+    reactimate $ drawHero <$> enextpos
+    reactimate $ handleExit <$ exit
+
+keyMap :: Char -> Maybe Input
+keyMap 'k' = Just Up
+keyMap 'j' = Just Down
+keyMap 'h' = Just Left
+keyMap 'l' = Just Right
+keyMap 'r' = Just Redraw
+keyMap 'q' = Just Exit
+keyMap _   = Nothing
+
+initScreen ::  IO ()
 initScreen = do
     hSetEcho stdin False
     hSetBuffering stdin  NoBuffering
@@ -105,6 +119,11 @@ initScreen = do
     hideCursor
     setTitle "Cabbages and Kings"
 
+-- Hardcoded screen size, but 640k should be enough for anybody
+isOnscreen :: Coord -> Bool
+isOnscreen (x,y) = x >= 0 && y >= 0 && x <= 79 && y <= 24
+
+drawHero :: Coord -> IO ()
 drawHero (heroX, heroY) = do
   clearScreen
   setCursorPosition heroY heroX
