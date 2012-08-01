@@ -90,7 +90,7 @@ network kp = do
                    `union` emright
                    `union` emrd
 
-        -- React by performing action
+        -- Perform that action
         enewpos  = emove `applyE` bpos
 
         -- ...but only if the result is on the screen
@@ -134,6 +134,7 @@ drawHero (heroX, heroY) = do
 
 -- when the user wants to exit we give them a thank you
 -- message and then reshow the cursor
+handleExit ::  IO ()
 handleExit = do
   clearScreen
   setCursorPosition 0 0
